@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 const cleanUrl = (s) => s.trim().replace(/^['"]|['"]$/g, "").replace(/\/+$/g, "");
+const formatCents = (c) => (c/100).toFixed(2);
 
 async function api({ baseUrl, path, method = "GET", body, token }) {
   const res = await fetch(`${baseUrl}${path}`, {
@@ -17,7 +18,7 @@ async function api({ baseUrl, path, method = "GET", body, token }) {
 }
 
 export default function App() {
-  // ---- Config / auth state ----
+  // ---- Config / auth ----
   const [baseUrl, setBaseUrl] = useState(() =>
     cleanUrl(localStorage.getItem("baseUrl") || "http://127.0.0.1:8004")
   );
@@ -30,11 +31,9 @@ export default function App() {
   useEffect(() => localStorage.setItem("baseUrl", baseUrl), [baseUrl]);
   useEffect(() => localStorage.setItem("token", token), [token]);
 
-  // ---- Catalog state ----
+  // ---- Catalog ----
   const [categories, setCategories] = useState([]);
   const [products, setProducts] = useState([]);
-
-  // inputs for creating new things
   const [newCat, setNewCat] = useState({ name: "Tees", slug: "tees" });
   const [newProd, setNewProd] = useState({
     name: "Classic Tee",
@@ -43,15 +42,17 @@ export default function App() {
     inventory: 5,
   });
 
+  // ---- Cart & Orders ----
+  const [cart, setCart] = useState([]); // [{product, qty}]
+  const [orders, setOrders] = useState([]);
+
   const isAdmin = me?.role === "admin";
+  const cartTotalCents = cart.reduce((sum, it) => sum + it.product.price_cents * it.qty, 0);
 
   // load lists whenever baseUrl changes
-  useEffect(() => {
-    loadCats();
-    loadProds();
-  }, [baseUrl]);
+  useEffect(() => { loadCats(); loadProds(); }, [baseUrl]);
 
-  // ---- API helpers ----
+  // ---------- API helpers ----------
   async function check() {
     try { await api({ baseUrl, path: "/healthz" }); setFlash("API OK ✅"); }
     catch (e) { setFlash(e.message); }
@@ -82,12 +83,16 @@ export default function App() {
     }
   }
 
-  function logout() { setToken(""); setMe(null); setFlash("Logged out"); }
+  function logout() {
+    setToken(""); setMe(null); setFlash("Logged out");
+    setOrders([]); setCart([]);
+  }
 
   async function loadCats() {
     try { setCategories(await api({ baseUrl, path: "/categories" })); }
     catch (e) { setFlash(e.message); }
   }
+
   async function loadProds() {
     try { setProducts(await api({ baseUrl, path: "/products" })); }
     catch (e) { setFlash(e.message); }
@@ -107,7 +112,7 @@ export default function App() {
         ...newProd,
         price_cents: Number(newProd.price_cents),
         inventory: Number(newProd.inventory) || 0,
-        category_id: newProd.category_id || null, // API allows null
+        category_id: newProd.category_id || null,
       };
       const p = await api({ baseUrl, path: "/products", method: "POST", body, token });
       setProducts([p, ...products]);
@@ -115,10 +120,57 @@ export default function App() {
     } catch (e) { setFlash(e.message); }
   }
 
-  // ---- UI ----
+  // ---------- Cart ----------
+  function addToCart(p) {
+    setCart((prev) => {
+      const i = prev.findIndex((x) => x.product.id === p.id);
+      if (i >= 0) {
+        const copy = [...prev];
+        copy[i] = { ...copy[i], qty: copy[i].qty + 1 };
+        return copy;
+      }
+      return [...prev, { product: p, qty: 1 }];
+    });
+  }
+  function inc(id) {
+    setCart((prev) => prev.map((it) => it.product.id === id ? { ...it, qty: it.qty + 1 } : it));
+  }
+  function dec(id) {
+    setCart((prev) =>
+      prev
+        .map((it) => it.product.id === id ? { ...it, qty: it.qty - 1 } : it)
+        .filter((it) => it.qty > 0)
+    );
+  }
+  function clearCart() { setCart([]); }
+
+  // ---------- Orders ----------
+  async function checkout() {
+    if (!token) { setFlash("Login first to checkout."); return; }
+    if (cart.length === 0) { setFlash("Cart is empty."); return; }
+    try {
+      const items = cart.map((it) => ({ product_id: it.product.id, qty: it.qty }));
+      const out = await api({ baseUrl, path: "/orders", method: "POST", body: { items }, token });
+      setFlash(`Order placed ✔ Total $${formatCents(out.total_cents)} (status ${out.status})`);
+      setOrders((prev) => [out, ...prev]);
+      clearCart();
+      // reload products to show reduced inventory
+      await loadProds();
+    } catch (e) { setFlash(e.message); }
+  }
+
+  async function loadMyOrders() {
+    try {
+      const list = await api({ baseUrl, path: "/orders", token });
+      setOrders(list);
+      setFlash(`Loaded ${list.length} orders`);
+    } catch (e) { setFlash(e.message); }
+  }
+
+  // ---------- UI ----------
   return (
     <div style={{ padding: 16, fontFamily: "system-ui, sans-serif", color:"#e5e7eb", background:"#0b0b0f", minHeight:"100vh" }}>
-      <h1>🛍️ Clothing UI</h1>
+      <h1>🛍️ Clothing Admin & Shop</h1>
 
       {/* Base URL */}
       <div style={{ display: "flex", gap: 8, margin: "12px 0" }}>
@@ -144,6 +196,7 @@ export default function App() {
         <button onClick={login}>Login</button>
         <button onClick={logout}>Logout</button>
         <button onClick={()=>fetchMe()}>/me</button>
+        <button onClick={loadMyOrders} disabled={!token} title={token ? "" : "Login first"}>Load my orders</button>
         <div>{me ? <>Logged as <b>{me.email}</b> ({me.role})</> : "Not logged in"}</div>
       </div>
 
@@ -176,14 +229,58 @@ export default function App() {
       </div>
       <ul>
         {products.map(p => (
-          <li key={p.id}>
-            {p.name} — ${(p.price_cents/100).toFixed(2)}{" "}
-            <small style={{color:"#9aa2b1"}}>inv {p.inventory}{p.category_id ? "" : " (no category)"}</small>
+          <li key={p.id} style={{ display:"flex", gap:8, alignItems:"center", marginBottom:6 }}>
+            <span>{p.name} — ${formatCents(p.price_cents)} <small style={{color:"#9aa2b1"}}>inv {p.inventory}{p.category_id ? "" : " (no category)"}</small></span>
+            <button onClick={()=>addToCart(p)} disabled={p.inventory <= 0} title={p.inventory>0 ? "" : "Out of stock"}>Add</button>
           </li>
         ))}
       </ul>
 
+      {/* Cart */}
+      <h2 style={{ marginTop: 16 }}>Cart</h2>
+      <div>
+        {cart.length === 0 ? (
+          <div>Cart is empty</div>
+        ) : (
+          <ul>
+            {cart.map(it => (
+              <li key={it.product.id} style={{ display:"flex", alignItems:"center", gap:8, marginBottom:6 }}>
+                <span>{it.product.name} — ${formatCents(it.product.price_cents)} × {it.qty}</span>
+                <button onClick={()=>dec(it.product.id)}>-</button>
+                <button onClick={()=>inc(it.product.id)}>+</button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+      <div style={{ display:"flex", gap:8, alignItems:"center", marginTop:8 }}>
+        <div><b>Total:</b> ${formatCents(cartTotalCents)}</div>
+        <button onClick={clearCart}>Clear</button>
+        <button onClick={checkout} disabled={!token || cart.length===0} title={token ? "" : "Login first"}>Checkout</button>
+      </div>
+
+      {/* Orders */}
+      <h2 style={{ marginTop: 16 }}>My Orders</h2>
+      {orders.length === 0 ? (
+        <div>No orders yet</div>
+      ) : (
+        <ul>
+          {orders.map(o => (
+            <li key={o.id} style={{ marginBottom:10 }}>
+              <div><b>Order</b> {o.id} • ${formatCents(o.total_cents)} • {o.status} • {new Date(o.created_at).toLocaleString()}</div>
+              <ul style={{ marginLeft:14 }}>
+                {o.items.map((it, idx) => (
+                  <li key={idx}>{it.name} × {it.qty} — ${formatCents(it.price_cents)}</li>
+                ))}
+              </ul>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {/* Status */}
       <div style={{ marginTop:12, color:"#0ea5e9" }}>{flash}</div>
     </div>
   );
 }
+
